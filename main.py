@@ -110,17 +110,22 @@ def enqueue_first_day(user_id: int):
     mark_started(user_id)
 
 def schedule_next(user_id: int, current_day: str):
+    """
+    Move to the next day. If current_day is the last (day_7a), finish.
+    """
     uid = str(user_id)
     if current_day not in config.DAY_KEYS:
         mark_cancelled(user_id, "internal_error_bad_day")
         return
-    if current_day == "day_7b":
+
+    # last day is NOW day_7a
+    if current_day == "day_7a":
         mark_finished(user_id)
         return
 
     idx = config.DAY_KEYS.index(current_day)
     next_day = config.DAY_KEYS[idx + 1]
-    delay = timedelta(minutes=config.DAY7B_DELAY_MIN) if next_day == "day_7b" else timedelta(hours=config.DAY_GAP_HOURS)
+    delay = timedelta(hours=config.DAY_GAP_HOURS)
     next_time = _now() + delay
 
     queue_state[uid] = {
@@ -370,8 +375,6 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                     await after.remove_roles(role, reason="Regained member role; remove former-member marker")
                     await log_other(f"🧹 Removed Former Member role from {_fmt_user(after)} (regained member).")
 
-# admin commands are identical to your original but pointing at our helpers
-
 @bot.command(name="start")
 @commands.has_permissions(administrator=True)
 async def start_sequence(ctx, member: discord.Member):
@@ -399,7 +402,7 @@ async def cancel_sequence(ctx, member: discord.Member):
 @commands.has_permissions(administrator=True)
 async def test_sequence(ctx, member: discord.Member):
     await ctx.reply(f"Starting test sequence for {member.mention}...")
-    for day_key in config.DAY_KEYS:
+    for day_key in config.DAY_KEYS:  # this now stops at day_7a
         try:
             mod = importlib.import_module(f"messages.{day_key}")
             join_url = config.UTM_LINKS[day_key]
@@ -421,15 +424,15 @@ async def relocate_sequence(ctx, member: discord.Member, day: str):
     if d.isdigit():
         idx = int(d) - 1
         day_key = config.DAY_KEYS[idx] if 0 <= idx < len(config.DAY_KEYS) else None
-    elif d in {"7a", "7b"}:
-        day_key = f"day_{d}"
+    elif d == "7a":
+        day_key = "day_7a"
     elif d.startswith("day_") and d in config.DAY_KEYS:
         day_key = d
     else:
         day_key = None
 
     if not day_key:
-        await ctx.reply("Invalid day. Use 1–6, 7a, 7b, or day_1..day_7b.")
+        await ctx.reply("Invalid day. Use 1–7, 7a, or day_1..day_7a.")
         return
 
     queue_state[str(member.id)] = {
