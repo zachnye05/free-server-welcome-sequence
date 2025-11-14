@@ -111,19 +111,20 @@ def enqueue_first_day(user_id: int):
 
 def schedule_next(user_id: int, current_day: str):
     """
-    Move to the next day. If current_day is the last (day_7a), finish.
+    Move to the next day. If current_day is the final key in config.DAY_KEYS, finish.
+    This no longer assumes the final key is `day_7a` — it looks up the last element.
     """
     uid = str(user_id)
     if current_day not in config.DAY_KEYS:
         mark_cancelled(user_id, "internal_error_bad_day")
         return
 
-    # last day is NOW day_7a
-    if current_day == "day_7a":
+    idx = config.DAY_KEYS.index(current_day)
+    # If we are on the last configured day, mark finished
+    if idx >= len(config.DAY_KEYS) - 1:
         mark_finished(user_id)
         return
 
-    idx = config.DAY_KEYS.index(current_day)
     next_day = config.DAY_KEYS[idx + 1]
     delay = timedelta(hours=config.DAY_GAP_HOURS)
     next_time = _now() + delay
@@ -402,7 +403,7 @@ async def cancel_sequence(ctx, member: discord.Member):
 @commands.has_permissions(administrator=True)
 async def test_sequence(ctx, member: discord.Member):
     await ctx.reply(f"Starting test sequence for {member.mention}...")
-    for day_key in config.DAY_KEYS:  # this now stops at day_7a
+    for day_key in config.DAY_KEYS:  # uses configured DAY_KEYS dynamically
         try:
             mod = importlib.import_module(f"messages.{day_key}")
             join_url = config.UTM_LINKS[day_key]
@@ -424,15 +425,25 @@ async def relocate_sequence(ctx, member: discord.Member, day: str):
     if d.isdigit():
         idx = int(d) - 1
         day_key = config.DAY_KEYS[idx] if 0 <= idx < len(config.DAY_KEYS) else None
-    elif d == "7a":
-        day_key = "day_7a"
+    elif d in ("7a", "7b"):
+        # map 7a/7b to the exact keys if present
+        if f"day_{d}" in config.DAY_KEYS:
+            day_key = f"day_{d}"
+        else:
+            day_key = None
+    elif d == "7":
+        # if user says "7" try to map to last day or day_7a if present
+        if len(config.DAY_KEYS) >= 7:
+            day_key = config.DAY_KEYS[6]  # zero-indexed: index 6 is day 7 if present
+        else:
+            day_key = None
     elif d.startswith("day_") and d in config.DAY_KEYS:
         day_key = d
     else:
         day_key = None
 
     if not day_key:
-        await ctx.reply("Invalid day. Use 1–7, 7a, or day_1..day_7a.")
+        await ctx.reply("Invalid day. Use 1–7, 7a, 7b, 7, or day_1..day_7b.")
         return
 
     queue_state[str(member.id)] = {
