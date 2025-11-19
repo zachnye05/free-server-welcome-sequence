@@ -4,8 +4,9 @@ import json
 import asyncio
 from datetime import datetime, timedelta, timezone
 import importlib
+import importlib.util
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple, List, Any
 from contextlib import suppress
 
 import discord
@@ -23,6 +24,7 @@ intents.guilds = True
 
 bot = commands.Bot(command_prefix=".", intents=intents)
 
+# State
 queue_state: Dict[str, Dict[str, str]] = {}
 registry: Dict[str, Dict[str, str]] = {}
 last_send_at: Optional[datetime] = None
@@ -112,7 +114,6 @@ def enqueue_first_day(user_id: int):
 def schedule_next(user_id: int, current_day: str):
     """
     Move to the next day. If current_day is the final key in config.DAY_KEYS, finish.
-    This no longer assumes the final key is `day_7a` — it looks up the last element.
     """
     uid = str(user_id)
     if current_day not in config.DAY_KEYS:
@@ -155,41 +156,159 @@ def has_member_role(member: discord.Member) -> bool:
 def has_former_member_role(member: discord.Member) -> bool:
     return any(r.id == config.FORMER_MEMBER_ROLE for r in member.roles)
 
+
+# -------------------------
+# Standardized view for all messages
+# -------------------------
+def make_standard_view(join_url: Optional[str]):
+    """
+    Returns a discord.ui.View that contains:
+      - a disabled green button labeled "$50M+ Profit" (visual only)
+      - a link button labeled "JOIN NOW" that opens join_url
+    """
+    v = discord.ui.View(timeout=None)
+    # Disabled green button (visual)
+    try:
+        v.add_item(discord.ui.Button(label="$50M+ Profit", style=discord.ButtonStyle.success, disabled=True))
+    except Exception:
+        # older libraries may raise; ignore and continue
+        pass
+
+    # Link button
+    if join_url:
+        try:
+            v.add_item(discord.ui.Button(label="JOIN NOW", url=join_url, style=discord.ButtonStyle.link))
+        except Exception:
+            # last-resort: no button
+            pass
+    return v
+
+
+# -------------------------
+# Message module loader + normalizer
+# -------------------------
+def load_message_module(day_key: str) -> Optional[Any]:
+    """
+    Returns the imported module or None if it doesn't exist.
+    """
+    module_name = f"messages.{day_key}"
+    if importlib.util.find_spec(module_name) is None:
+        return None
+    try:
+        return importlib.import_module(module_name)
+    except Exception as e:
+        log.warning(f"Failed importing module {module_name}: {e}")
+        return None
+
+def normalize_message_output(mod: Any, join_url: Optional[str]) -> Tuple[List[discord.Embed], Optional[discord.ui.View]]:
+    """
+    Supports two message module styles:
+      - build_embed(join_url=...) -> (List[Embed], View|None)
+      - get_message(join_url) -> Embed (single)
+    Returns (embeds, view). If module returns None/invalid, raises.
+    """
+    # Attempt build_embed
+    if hasattr(mod, "build_embed"):
+        try:
+            res = mod.build_embed(join_url=join_url)
+            if isinstance(res, tuple) and len(res) == 2:
+                embeds, view = res
+                # ensure embeds is a list
+                if not isinstance(embeds, (list, tuple)):
+                    embeds = [embeds]
+                return list(embeds), make_standard_view(join_url)
+        except Exception as e:
+            raise
+
+    # Attempt get_message
+    if hasattr(mod, "get_message"):
+        try:
+            res = mod.get_message(join_url)
+            # allow either embed or (embed, view)
+            if isinstance(res, tuple) and len(res) == 2:
+                embeds, view = res
+                if not isinstance(embeds, (list, tuple)):
+                    embeds = [embeds]
+                return list(embeds), make_standard_view(join_url)
+            else:
+                # single embed
+                if not isinstance(res, (list, tuple)):
+                    return [res], make_standard_view(join_url)
+                else:
+                    return list(res), make_standard_view(join_url)
+        except Exception as e:
+            raise
+
+    # If none of the expected functions exist, raise
+    raise RuntimeError("Message module has no `build_embed` or `get_message`.")
+
+
+# -------------------------
+# Sending helpers
+# -------------------------
+async def send_embeds_with_view(target: discord.abc.Messageable, embeds: List[discord.Embed], view: Optional[discord.ui.View]):
+    """
+    Sends embeds with the provided view. Handles errors and logs.
+    """
+    try:
+        if view:
+            await target.send(embeds=embeds, view=view)
+        else:
+            await target.send(embeds=embeds)
+    except discord.Forbidden:
+        raise
+    except Exception as e:
+        log.warning(f"Failed to send embeds to {target}: {e}")
+        raise
+
+
 async def send_day(member: discord.Member, day_key: str):
+    """
+    Send one day's message. If the module is missing, SKIP the day (do not cancel the user's sequence).
+    If UTM missing for that day, SKIP the day.
+    """
     global last_send_at
 
+    # rate spacing between DMs
     if last_send_at:
         delta = (_now() - last_send_at).total_seconds()
         if delta < config.SEND_SPACING_SECONDS:
             await asyncio.sleep(config.SEND_SPACING_SECONDS - delta)
 
+    # cancel pre-checks
     if has_cancel_role(member):
         mark_cancelled(member.id, "cancel_role_present_pre_send")
         await log_other(f"🛑 Cancelled pre-send for {_fmt_user(member)} — cancel role present.")
         return
 
-    try:
-        mod = importlib.import_module(f"messages.{day_key}")
-    except Exception as e:
-        mark_cancelled(member.id, "missing_message_module")
-        await log_other(f"❌ Import error `{day_key}` for {_fmt_user(member)}: `{e}`. Sequence cancelled.")
+    # load module (skip if missing)
+    mod = load_message_module(day_key)
+    if mod is None:
+        await log_other(f"ℹ️ Skipping {day_key} for {_fmt_user(member)} — module not found.")
         return
 
+    # get join_url (skip if missing)
     join_url = config.UTM_LINKS.get(day_key)
     if not join_url:
-        mark_cancelled(member.id, "missing_utm")
-        await log_other(f"❌ Missing UTM for `{day_key}` on {_fmt_user(member)}. Sequence cancelled.")
+        await log_other(f"ℹ️ Skipping {day_key} for {_fmt_user(member)} — UTM link missing.")
         return
 
+    # normalize content
     try:
-        embeds, view = mod.build_embed(join_url=join_url)
+        embeds, view = normalize_message_output(mod, join_url)
+    except discord.Forbidden:
+        # unlikely here, but propagate
+        mark_cancelled(member.id, "dm_forbidden")
+        await log_other(f"🚫 DM forbidden for {_fmt_user(member)} — sequence cancelled.")
+        return
     except Exception as e:
-        mark_cancelled(member.id, "embed_build_error")
-        await log_other(f"❌ build_embed error `{day_key}` for {_fmt_user(member)}: `{e}`. Sequence cancelled.")
+        # if module errors while building embed, skip that day and log
+        await log_other(f"⚠️ Skipping {day_key} for {_fmt_user(member)} — message build error: `{e}`")
         return
 
+    # use standardized view (make_standard_view already used by normalizer)
     try:
-        await member.send(embeds=embeds, view=view)
+        await send_embeds_with_view(member, embeds, view)
         last_send_at = _now()
         if day_key == "day_1":
             await log_first(f"✅ Sent **{day_key}** to {_fmt_user(member)}")
@@ -201,55 +320,10 @@ async def send_day(member: discord.Member, day_key: str):
     except Exception as e:
         await log_other(f"⚠️ Failed to send **{day_key}** to {_fmt_user(member)}: `{e}`")
 
-async def check_and_assign_role(member: discord.Member):
-    if member.bot or member.id in pending_checks:
-        return
-    pending_checks.add(member.id)
-    try:
-        await asyncio.sleep(60)
-        has_any = any(role.id in config.ROLES_TO_CHECK for role in member.roles)
-        if not has_any:
-            role = member.guild.get_role(config.ROLE_TRIGGER)
-            if role is None:
-                await log_other(f"❌ Fallback role not found for {_fmt_user(member)}")
-                return
-            try:
-                await member.add_roles(role, reason="No valid roles after 60s")
-                await log_other(f"✅ Gave fallback role to **{member.display_name}** (`{member.id}`)")
-                if not has_sequence_before(member.id):
-                    enqueue_first_day(member.id)
-                    await log_first(f"🧵 Enqueued **day_1** for {_fmt_user(member)} (fallback role assigned)")
-            except Exception as e:
-                await log_other(f"⚠️ Failed to assign role to **{member.display_name}** (`{member.id}`): `{e}`")
-    finally:
-        pending_checks.discard(member.id)
 
-async def delayed_assign_former_member(member: discord.Member):
-    if member.bot or member.id in pending_former_checks:
-        return
-    pending_former_checks.add(member.id)
-    try:
-        await asyncio.sleep(config.FORMER_MEMBER_DELAY_SECONDS)
-        guild = bot.get_guild(config.GUILD_ID)
-        if not guild:
-            return
-        refreshed = guild.get_member(member.id)
-        if not refreshed:
-            return
-        if has_member_role(refreshed):
-            await log_other(f"↩️ {_fmt_user(refreshed)} regained member role during delay — not marking former.")
-            return
-        if not has_former_member_role(refreshed):
-            role = guild.get_role(config.FORMER_MEMBER_ROLE)
-            if role:
-                try:
-                    await refreshed.add_roles(role, reason="Lost member role; mark as former member")
-                    await log_other(f"🏷️ Marked **{refreshed.display_name}** as Former Member")
-                except Exception as e:
-                    await log_other(f"⚠️ Failed to add former-member role: `{e}`")
-    finally:
-        pending_former_checks.discard(member.id)
-
+# -------------------------
+# Scheduler loop
+# -------------------------
 @tasks.loop(seconds=10)
 async def scheduler_loop():
     try:
@@ -277,8 +351,10 @@ async def scheduler_loop():
                     await log_other(f"🛑 Cancelled for {_fmt_user(member)} — cancel role present.")
                     continue
 
+                # send day (this function will SKIP missing modules instead of cancelling)
                 await send_day(member, day_key)
 
+                # if user still in queue, schedule next
                 if str(member.id) in queue_state:
                     prev = day_key
                     schedule_next(member.id, day_key)
@@ -293,6 +369,7 @@ async def scheduler_loop():
     except Exception as e:
         await log_other(f"❌ scheduler_loop tick error: `{e}`")
 
+
 @scheduler_loop.error
 async def scheduler_loop_error(error):
     await log_other(f"🔁 scheduler_loop crashed: `{error}` — restarting in 5s")
@@ -302,6 +379,10 @@ async def scheduler_loop_error(error):
     with suppress(Exception):
         scheduler_loop.start()
 
+
+# -------------------------
+# Boot & member events
+# -------------------------
 @bot.event
 async def on_ready():
     global queue_state, registry
@@ -310,6 +391,7 @@ async def on_ready():
     queue_state = load_json(config.QUEUE_FILE)
     registry = load_json(config.REGISTRY_FILE)
 
+    # nudge any overdue sends to 5s in the future to process immediately
     for uid, payload in queue_state.items():
         iso = payload.get("next_send")
         if not iso or is_due(iso):
@@ -331,11 +413,13 @@ async def on_ready():
         if scheduled:
             await log_other(f"🔍 Scheduled fallback role checks for **{scheduled}** member(s) on boot.")
 
+
 @bot.event
 async def on_member_join(member: discord.Member):
     if member.guild.id == config.GUILD_ID and not member.bot:
         await log_other(f"👤 New member joined: **{member.display_name}** (`{member.id}`) — checking roles in 60s")
         asyncio.create_task(check_and_assign_role(member))
+
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
@@ -376,6 +460,64 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                     await after.remove_roles(role, reason="Regained member role; remove former-member marker")
                     await log_other(f"🧹 Removed Former Member role from {_fmt_user(after)} (regained member).")
 
+
+# -------------------------
+# Role helpers used earlier
+# -------------------------
+async def check_and_assign_role(member: discord.Member):
+    if member.bot or member.id in pending_checks:
+        return
+    pending_checks.add(member.id)
+    try:
+        await asyncio.sleep(60)
+        has_any = any(role.id in config.ROLES_TO_CHECK for role in member.roles)
+        if not has_any:
+            role = member.guild.get_role(config.ROLE_TRIGGER)
+            if role is None:
+                await log_other(f"❌ Fallback role not found for {_fmt_user(member)}")
+                return
+            try:
+                await member.add_roles(role, reason="No valid roles after 60s")
+                await log_other(f"✅ Gave fallback role to **{member.display_name}** (`{member.id}`)")
+                if not has_sequence_before(member.id):
+                    enqueue_first_day(member.id)
+                    await log_first(f"🧵 Enqueued **day_1** for {_fmt_user(member)} (fallback role assigned)")
+            except Exception as e:
+                await log_other(f"⚠️ Failed to assign role to **{member.display_name}** (`{member.id}`): `{e}`")
+    finally:
+        pending_checks.discard(member.id)
+
+
+async def delayed_assign_former_member(member: discord.Member):
+    if member.bot or member.id in pending_former_checks:
+        return
+    pending_former_checks.add(member.id)
+    try:
+        await asyncio.sleep(config.FORMER_MEMBER_DELAY_SECONDS)
+        guild = bot.get_guild(config.GUILD_ID)
+        if not guild:
+            return
+        refreshed = guild.get_member(member.id)
+        if not refreshed:
+            return
+        if has_member_role(refreshed):
+            await log_other(f"↩️ {_fmt_user(refreshed)} regained member role during delay — not marking former.")
+            return
+        if not has_former_member_role(refreshed):
+            role = guild.get_role(config.FORMER_MEMBER_ROLE)
+            if role:
+                try:
+                    await refreshed.add_roles(role, reason="Lost member role; mark as former member")
+                    await log_other(f"🏷️ Marked **{refreshed.display_name}** as Former Member")
+                except Exception as e:
+                    await log_other(f"⚠️ Failed to add former-member role: `{e}`")
+    finally:
+        pending_former_checks.discard(member.id)
+
+
+# -------------------------
+# Admin and test commands
+# -------------------------
 @bot.command(name="start")
 @commands.has_permissions(administrator=True)
 async def start_sequence(ctx, member: discord.Member):
@@ -389,6 +531,7 @@ async def start_sequence(ctx, member: discord.Member):
     await ctx.reply(f"Queued day_1 for {member.mention} now.")
     await log_first(f"🧵 (Admin) Enqueued **day_1** for {_fmt_user(member)}")
 
+
 @bot.command(name="cancel")
 @commands.has_permissions(administrator=True)
 async def cancel_sequence(ctx, member: discord.Member):
@@ -399,24 +542,65 @@ async def cancel_sequence(ctx, member: discord.Member):
     await ctx.reply(f"Cancelled sequence for {member.mention}.")
     await log_other(f"🛑 (Admin) Cancelled sequence for {_fmt_user(member)}")
 
+
 @bot.command(name="test")
 @commands.has_permissions(administrator=True)
 async def test_sequence(ctx, member: discord.Member):
-    await ctx.reply(f"Starting test sequence for {member.mention}...")
-    for day_key in config.DAY_KEYS:  # uses configured DAY_KEYS dynamically
+    """
+    Admin test: send the configured DAY_KEYS sequence to a particular member (quickly).
+    """
+    await ctx.reply(f"Starting admin test sequence for {member.mention}...")
+    for day_key in config.DAY_KEYS:
+        # skip if module missing
+        mod = load_message_module(day_key)
+        if mod is None:
+            await log_other(f"🧪 Skipping test {day_key} — module not found.")
+            continue
+        join_url = config.UTM_LINKS.get(day_key)
+        if not join_url:
+            await log_other(f"🧪 Skipping test {day_key} — UTM missing.")
+            continue
         try:
-            mod = importlib.import_module(f"messages.{day_key}")
-            join_url = config.UTM_LINKS[day_key]
-            embeds, view = mod.build_embed(join_url=join_url)
-            await member.send(embeds=embeds, view=view)
+            embeds, view = normalize_message_output(mod, join_url)
+            await send_embeds_with_view(member, embeds, view)
             if day_key == "day_1":
                 await log_first(f"🧪 TEST sent **{day_key}** to {_fmt_user(member)}")
             else:
                 await log_other(f"🧪 TEST sent **{day_key}** to {_fmt_user(member)}")
         except Exception as e:
             await log_other(f"🧪❌ TEST failed `{day_key}` for {_fmt_user(member)}: `{e}`")
-        await asyncio.sleep(10)
-    await ctx.send(f"✅ Test sequence complete for {member.mention}.")
+        await asyncio.sleep(1)  # very short spacing for quick admin tests
+    await ctx.send(f"✅ Admin test sequence complete for {member.mention}.")
+
+
+@bot.command(name="testme")
+async def testme_sequence(ctx):
+    """
+    Non-admin test: send the entire configured DAY_KEYS sequence in quick succession to the command caller.
+    """
+    caller = ctx.author
+    await ctx.reply("📩 Sending you the test sequence in DM (check your DMs).")
+    for day_key in config.DAY_KEYS:
+        mod = load_message_module(day_key)
+        if mod is None:
+            await log_other(f"🧪 (testme) Skipping {day_key} — module not found.")
+            continue
+        join_url = config.UTM_LINKS.get(day_key)
+        if not join_url:
+            await log_other(f"🧪 (testme) Skipping {day_key} — UTM missing.")
+            continue
+        try:
+            embeds, view = normalize_message_output(mod, join_url)
+            await send_embeds_with_view(caller, embeds, view)
+            if day_key == "day_1":
+                await log_first(f"🧪 TESTME sent **{day_key}** to {_fmt_user(caller)}")
+            else:
+                await log_other(f"🧪 TESTME sent **{day_key}** to {_fmt_user(caller)}")
+        except Exception as e:
+            await log_other(f"🧪❌ TESTME failed `{day_key}` for {_fmt_user(caller)}: `{e}`")
+        await asyncio.sleep(1)
+    await ctx.send("✅ Test sequence complete. Check your DMs.")
+
 
 @bot.command(name="relocate")
 @commands.has_permissions(administrator=True)
@@ -454,6 +638,10 @@ async def relocate_sequence(ctx, member: discord.Member, day: str):
     await ctx.reply(f"Relocated {member.mention} to **{day_key}**, will send in ~5s.")
     await log_other(f"➡️ Relocated {_fmt_user(member)} to **{day_key}**")
 
+
+# -------------------------
+# Run
+# -------------------------
 if __name__ == "__main__":
     if not config.TOKEN:
         raise RuntimeError("TOKEN env var is required")
