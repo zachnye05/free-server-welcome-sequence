@@ -22,9 +22,10 @@ intents.message_content = True
 intents.members = True
 intents.guilds = True
 
-bot = commands.Bot(command_prefix=".", intents=intents)
+# Accept commands via . or ! and when the bot is mentioned
+bot = commands.Bot(command_prefix=commands.when_mentioned_or(".", "!"), intents=intents)
 
-# State
+# -- State
 queue_state: Dict[str, Dict[str, str]] = {}
 registry: Dict[str, Dict[str, str]] = {}
 last_send_at: Optional[datetime] = None
@@ -112,9 +113,6 @@ def enqueue_first_day(user_id: int):
     mark_started(user_id)
 
 def schedule_next(user_id: int, current_day: str):
-    """
-    Move to the next day. If current_day is the final key in config.DAY_KEYS, finish.
-    """
     uid = str(user_id)
     if current_day not in config.DAY_KEYS:
         mark_cancelled(user_id, "internal_error_bad_day")
@@ -171,7 +169,6 @@ def make_standard_view(join_url: Optional[str]):
     try:
         v.add_item(discord.ui.Button(label="$50M+ Profit", style=discord.ButtonStyle.success, disabled=True))
     except Exception:
-        # older libraries may raise; ignore and continue
         pass
 
     # Link button
@@ -179,7 +176,6 @@ def make_standard_view(join_url: Optional[str]):
         try:
             v.add_item(discord.ui.Button(label="JOIN NOW", url=join_url, style=discord.ButtonStyle.link))
         except Exception:
-            # last-resort: no button
             pass
     return v
 
@@ -202,63 +198,70 @@ def load_message_module(day_key: str) -> Optional[Any]:
 
 def normalize_message_output(mod: Any, join_url: Optional[str]) -> Tuple[List[discord.Embed], Optional[discord.ui.View]]:
     """
-    Supports two message module styles:
+    Normalize message module output to (List[Embed], View|None).
+    Accepts:
       - build_embed(join_url=...) -> (List[Embed], View|None)
-      - get_message(join_url) -> Embed (single)
-    Returns (embeds, view). If module returns None/invalid, raises.
+      - get_message(join_url) -> Embed or (Embed, View)
+    If returned view is None, make_standard_view(join_url) will be used by the sender.
     """
-    # Attempt build_embed
+    # build_embed preferred
     if hasattr(mod, "build_embed"):
-        try:
-            res = mod.build_embed(join_url=join_url)
-            if isinstance(res, tuple) and len(res) == 2:
-                embeds, view = res
-                # ensure embeds is a list
-                if not isinstance(embeds, (list, tuple)):
-                    embeds = [embeds]
-                return list(embeds), make_standard_view(join_url)
-        except Exception as e:
-            raise
+        res = mod.build_embed(join_url=join_url)
+        if isinstance(res, tuple) and len(res) == 2:
+            embeds, view = res
+            if not isinstance(embeds, (list, tuple)):
+                embeds = [embeds]
+            return list(embeds), view
+        # if somebody returned just embeds
+        if isinstance(res, (list, tuple)):
+            return list(res), None
 
-    # Attempt get_message
+    # fallback to get_message
     if hasattr(mod, "get_message"):
-        try:
-            res = mod.get_message(join_url)
-            # allow either embed or (embed, view)
-            if isinstance(res, tuple) and len(res) == 2:
-                embeds, view = res
-                if not isinstance(embeds, (list, tuple)):
-                    embeds = [embeds]
-                return list(embeds), make_standard_view(join_url)
+        res = mod.get_message(join_url)
+        if isinstance(res, tuple) and len(res) == 2:
+            embeds, view = res
+            if not isinstance(embeds, (list, tuple)):
+                embeds = [embeds]
+            return list(embeds), view
+        else:
+            if not isinstance(res, (list, tuple)):
+                return [res], None
             else:
-                # single embed
-                if not isinstance(res, (list, tuple)):
-                    return [res], make_standard_view(join_url)
-                else:
-                    return list(res), make_standard_view(join_url)
-        except Exception as e:
-            raise
+                return list(res), None
 
-    # If none of the expected functions exist, raise
     raise RuntimeError("Message module has no `build_embed` or `get_message`.")
 
 
 # -------------------------
 # Sending helpers
 # -------------------------
-async def send_embeds_with_view(target: discord.abc.Messageable, embeds: List[discord.Embed], view: Optional[discord.ui.View]):
+async def send_embeds_with_view(target: discord.abc.Messageable, embeds: List[discord.Embed], view: Optional[discord.ui.View], join_url: Optional[str]=None):
     """
-    Sends embeds with the provided view. Handles errors and logs.
+    Sends a list of embeds such that:
+      - all embeds except the last are sent without a view
+      - the last embed is sent with the provided view; if view is None, main.py will attach a standard view (JOIN NOW)
     """
+    if not embeds:
+        return
+
+    # send all but last without view
+    for e in embeds[:-1]:
+        try:
+            await target.send(embed=e)
+        except Exception as e:
+            log.warning(f"Failed to send non-action embed to {target}: {e}")
+
+    # last embed: attach view (or generated standard view)
+    last = embeds[-1]
+    final_view = view if view is not None else make_standard_view(join_url)
     try:
-        if view:
-            await target.send(embeds=embeds, view=view)
+        if final_view:
+            await target.send(embed=last, view=final_view)
         else:
-            await target.send(embeds=embeds)
-    except discord.Forbidden:
-        raise
+            await target.send(embed=last)
     except Exception as e:
-        log.warning(f"Failed to send embeds to {target}: {e}")
+        log.warning(f"Failed to send final embed to {target}: {e}")
         raise
 
 
@@ -296,19 +299,13 @@ async def send_day(member: discord.Member, day_key: str):
     # normalize content
     try:
         embeds, view = normalize_message_output(mod, join_url)
-    except discord.Forbidden:
-        # unlikely here, but propagate
-        mark_cancelled(member.id, "dm_forbidden")
-        await log_other(f"🚫 DM forbidden for {_fmt_user(member)} — sequence cancelled.")
-        return
     except Exception as e:
-        # if module errors while building embed, skip that day and log
         await log_other(f"⚠️ Skipping {day_key} for {_fmt_user(member)} — message build error: `{e}`")
         return
 
-    # use standardized view (make_standard_view already used by normalizer)
+    # send banner/embed sequence: banner(s) first, final embed with view
     try:
-        await send_embeds_with_view(member, embeds, view)
+        await send_embeds_with_view(member, embeds, view, join_url=join_url)
         last_send_at = _now()
         if day_key == "day_1":
             await log_first(f"✅ Sent **{day_key}** to {_fmt_user(member)}")
@@ -381,7 +378,7 @@ async def scheduler_loop_error(error):
 
 
 # -------------------------
-# Boot & member events
+# Boot & events
 # -------------------------
 @bot.event
 async def on_ready():
@@ -562,7 +559,7 @@ async def test_sequence(ctx, member: discord.Member):
             continue
         try:
             embeds, view = normalize_message_output(mod, join_url)
-            await send_embeds_with_view(member, embeds, view)
+            await send_embeds_with_view(member, embeds, view, join_url=join_url)
             if day_key == "day_1":
                 await log_first(f"🧪 TEST sent **{day_key}** to {_fmt_user(member)}")
             else:
@@ -573,33 +570,82 @@ async def test_sequence(ctx, member: discord.Member):
     await ctx.send(f"✅ Admin test sequence complete for {member.mention}.")
 
 
-@bot.command(name="testme")
+@bot.command(name="testme", aliases=["testdm", "testdmme"])
 async def testme_sequence(ctx):
     """
-    Non-admin test: send the entire configured DAY_KEYS sequence in quick succession to the command caller.
+    Non-admin diagnostic test: sends the configured DAY_KEYS sequence in quick succession to the command caller.
+    It first tries a plain-text DM to verify basic DM ability, then attempts embed sends and reports any failures in-channel.
     """
     caller = ctx.author
-    await ctx.reply("📩 Sending you the test sequence in DM (check your DMs).")
+    await ctx.reply("📩 Starting diagnostic test: I'll try a plain DM, then each message. Check your DMs / Message Requests.")
+
+    # plain DM check
+    try:
+        dm = await caller.create_dm()
+        await dm.send("🔎 DM check: this is a plain-text test. If you see this, DMs are allowed.")
+    except discord.Forbidden:
+        await ctx.send("❌ Could not send a plain DM — your privacy settings likely block DMs from server members.")
+        return
+    except Exception as e:
+        await ctx.send(f"⚠️ Unexpected error sending plain DM: `{e}` — check bot logs.")
+        return
+
     for day_key in config.DAY_KEYS:
         mod = load_message_module(day_key)
         if mod is None:
-            await log_other(f"🧪 (testme) Skipping {day_key} — module not found.")
+            await ctx.send(f"ℹ️ Skipping `{day_key}`: message module not found.")
             continue
         join_url = config.UTM_LINKS.get(day_key)
         if not join_url:
-            await log_other(f"🧪 (testme) Skipping {day_key} — UTM missing.")
+            await ctx.send(f"ℹ️ Skipping `{day_key}`: UTM link missing.")
             continue
+
+        # try a small plain note first
+        try:
+            await dm.send(f"TEST (plain) for `{day_key}` — if you see this, DM plain-text sending works.")
+        except discord.Forbidden:
+            await ctx.send(f"❌ Plain DM for `{day_key}` failed (discord.Forbidden). Privacy settings or blocked bot.")
+            return
+        except Exception as e:
+            await ctx.send(f"⚠️ Plain DM for `{day_key}` error: `{e}` — check logs.")
+            return
+
+        await asyncio.sleep(0.5)
+
+        # build and send embeds
         try:
             embeds, view = normalize_message_output(mod, join_url)
-            await send_embeds_with_view(caller, embeds, view)
-            if day_key == "day_1":
-                await log_first(f"🧪 TESTME sent **{day_key}** to {_fmt_user(caller)}")
-            else:
-                await log_other(f"🧪 TESTME sent **{day_key}** to {_fmt_user(caller)}")
         except Exception as e:
-            await log_other(f"🧪❌ TESTME failed `{day_key}` for {_fmt_user(caller)}: `{e}`")
+            await ctx.send(f"⚠️ Failed building embeds for `{day_key}`: `{e}` — skipping embed send.")
+            continue
+
+        try:
+            await send_embeds_with_view(dm, embeds, view, join_url=join_url)
+            await ctx.send(f"✅ Sent embed(s) for `{day_key}` (check DM).")
+        except discord.Forbidden:
+            await ctx.send(f"❌ Embed send for `{day_key}` failed with discord.Forbidden — privacy/settings or blocked.")
+            return
+        except Exception as e:
+            await ctx.send(f"⚠️ Embed send for `{day_key}` failed: `{e}` — check bot logs.")
+            continue
+
         await asyncio.sleep(1)
-    await ctx.send("✅ Test sequence complete. Check your DMs.")
+
+    await ctx.send("✅ Diagnostic test complete. Check your DMs and bot logs for details.")
+
+
+@bot.command(name="dmcheck")
+async def dmcheck(ctx):
+    """Try to DM the caller with a tiny test message and report result back in channel."""
+    user = ctx.author
+    try:
+        dm = await user.create_dm()
+        await dm.send("🔎 DM check: if you see this, your DMs are open.")
+        await ctx.reply("✅ DM sent — check your DMs (Message Requests if not in main list).")
+    except discord.Forbidden:
+        await ctx.reply("❌ Could not send DM — your privacy settings likely block DMs from server members.")
+    except Exception as e:
+        await ctx.reply(f"⚠️ Unexpected error sending DM: `{e}` (check bot logs).")
 
 
 @bot.command(name="relocate")
@@ -610,15 +656,13 @@ async def relocate_sequence(ctx, member: discord.Member, day: str):
         idx = int(d) - 1
         day_key = config.DAY_KEYS[idx] if 0 <= idx < len(config.DAY_KEYS) else None
     elif d in ("7a", "7b"):
-        # map 7a/7b to the exact keys if present
         if f"day_{d}" in config.DAY_KEYS:
             day_key = f"day_{d}"
         else:
             day_key = None
     elif d == "7":
-        # if user says "7" try to map to last day or day_7a if present
         if len(config.DAY_KEYS) >= 7:
-            day_key = config.DAY_KEYS[6]  # zero-indexed: index 6 is day 7 if present
+            day_key = config.DAY_KEYS[6]
         else:
             day_key = None
     elif d.startswith("day_") and d in config.DAY_KEYS:
