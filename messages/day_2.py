@@ -1,23 +1,26 @@
-# messages/day_2.py
-import os
 import discord
-from discord.ui import View, Button
-from typing import Tuple, Optional, List
 
-def build_embed(join_url: str) -> Tuple[List[discord.Embed], Optional[View]]:
-    title = "Quick reminder — don’t miss this"
-    description = (
-        "Hey — just checking in. If you haven’t yet, grab the free resources and check the most popular threads. "
-        "Lots of wins get posted daily."
+BANNER_URL = "https://media.discordapp.net/attachments/1436108078612484189/1436115777265598555/image.png"
+
+def get_message(join_url: str):
+    embed = discord.Embed(
+        title="WALMART SELLING MACBOOKS FOR $23<a:PartyBear:774254653197647892>",
+        description=(
+            "Walmart is marking down Macbook Airs as low as **$23** at select stores.\n\n"
+            "Our software lets Divine members check **all stores within 50 miles** of their home "
+            "to instantly see whether their stores have the deal.\n\n"
+            "Want access?👇"
+        ),
+        color=0x5865F2
     )
-    embed = discord.Embed(title=title, description=description)
-    banner = os.environ.get("BANNER_DAY_2")
-    if banner:
-        embed.set_image(url=banner)
-    embed.set_footer(text="Small actions compound — start today.")
 
-    view = None
-    if join_url:
-        view = View(timeout=None)
-        view.add_item(Button(label="JOIN NOW", url=join_url))
-    return [embed], view
+    embed.set_image(url=BANNER_URL)
+
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(
+        label="CLAIM YOUR FREE WEEK NOW",
+        url=join_url,
+        style=discord.ButtonStyle.link
+    ))
+
+    return embed, view
