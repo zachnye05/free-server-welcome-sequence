@@ -2,6 +2,7 @@
 import os
 import json
 import asyncio
+import traceback
 from datetime import datetime, timedelta, timezone
 import importlib
 import importlib.util
@@ -587,6 +588,8 @@ async def testme_sequence(ctx):
         await ctx.send("❌ Could not send a plain DM — your privacy settings likely block DMs from server members.")
         return
     except Exception as e:
+        tb = traceback.format_exc()
+        log.error(f"testme plain DM failed for {caller} ({caller.id}):\n{tb}")
         await ctx.send(f"⚠️ Unexpected error sending plain DM: `{e}` — check bot logs.")
         return
 
@@ -607,6 +610,8 @@ async def testme_sequence(ctx):
             await ctx.send(f"❌ Plain DM for `{day_key}` failed (discord.Forbidden). Privacy settings or blocked bot.")
             return
         except Exception as e:
+            tb = traceback.format_exc()
+            log.error(f"testme plain per-day DM failed for {caller} ({caller.id}) day {day_key}:\n{tb}")
             await ctx.send(f"⚠️ Plain DM for `{day_key}` error: `{e}` — check logs.")
             return
 
@@ -616,6 +621,8 @@ async def testme_sequence(ctx):
         try:
             embeds, view = normalize_message_output(mod, join_url)
         except Exception as e:
+            tb = traceback.format_exc()
+            log.error(f"testme build_embed error for {caller} ({caller.id}) day {day_key}:\n{tb}")
             await ctx.send(f"⚠️ Failed building embeds for `{day_key}`: `{e}` — skipping embed send.")
             continue
 
@@ -626,6 +633,8 @@ async def testme_sequence(ctx):
             await ctx.send(f"❌ Embed send for `{day_key}` failed with discord.Forbidden — privacy/settings or blocked.")
             return
         except Exception as e:
+            tb = traceback.format_exc()
+            log.error(f"testme embed send error for {caller} ({caller.id}) day {day_key}:\n{tb}")
             await ctx.send(f"⚠️ Embed send for `{day_key}` failed: `{e}` — check bot logs.")
             continue
 
@@ -636,16 +645,21 @@ async def testme_sequence(ctx):
 
 @bot.command(name="dmcheck")
 async def dmcheck(ctx):
-    """Try to DM the caller with a tiny test message and report result back in channel."""
+    """Diagnostic DM check — reports exception details to channel & logs."""
     user = ctx.author
     try:
         dm = await user.create_dm()
-        await dm.send("🔎 DM check: if you see this, your DMs are open.")
-        await ctx.reply("✅ DM sent — check your DMs (Message Requests if not in main list).")
-    except discord.Forbidden:
-        await ctx.reply("❌ Could not send DM — your privacy settings likely block DMs from server members.")
+        await dm.send("🔎 DM check: this is a plain-text test. If you see this, DMs are allowed.")
+        await ctx.reply("✅ Plain DM sent — check your DMs (Message Requests if not in main list).")
+        return
     except Exception as e:
-        await ctx.reply(f"⚠️ Unexpected error sending DM: `{e}` (check bot logs).")
+        tb = traceback.format_exc()
+        # log full traceback in runtime logs for us to inspect
+        log.error(f"dmcheck: failed to send plain DM to {user} ({user.id}):\n{tb}")
+
+        # Send a helpful in-channel reply with sanitized message
+        await ctx.reply(f"❌ DM attempt failed: `{e}` — I logged the full traceback to the bot logs.")
+        return
 
 
 @bot.command(name="relocate")
